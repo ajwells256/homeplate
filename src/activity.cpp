@@ -3,30 +3,97 @@
 #define ACTIVITY_TASK_PRIORITY 4
 
 static bool resetActivity = false;
+static SemaphoreHandle_t resetActivityMutex = xSemaphoreCreateMutex();
+static SemaphoreHandle_t startActivityMutex = xSemaphoreCreateMutex();
 uint activityCount = 0;
+uint timeToSleep = 0;
 
 QueueHandle_t activityQueue = xQueueCreate(1, sizeof(Activity));
 
 static unsigned long lastActivityTime = 0;
 static Activity activityNext, activityCurrent = NONE;
+// Last activity that painted the e-ink screen. RTC_DATA_ATTR so it survives
+// deep sleep — the e-ink panel retains pixels across sleep, so a render
+// dedupe that compares against the *prior wake's* activity is still valid.
+// NONE = nothing has rendered yet (fresh boot, or only the sleep-prep
+// no-op has run). Read by Trmnl to skip its filename-match shortcut when
+// another activity has repainted the screen between Trmnl runs.
+RTC_DATA_ATTR static Activity lastDisplayedActivity = NONE;
+
+Activity getLastDisplayedActivity() { return lastDisplayedActivity; }
+
+Activity activityFromString(const char *s)
+{
+    if (!s) return HomeAssistant;
+    if (strcmp(s, "HomeAssistant") == 0) return HomeAssistant;
+    if (strcmp(s, "Trmnl") == 0) return Trmnl;
+    if (strcmp(s, "GuestWifi") == 0) return GuestWifi;
+    if (strcmp(s, "Info") == 0) return Info;
+    if (strcmp(s, "Message") == 0) return Message;
+    if (strcmp(s, "IMG") == 0) return IMG;
+    if (strcmp(s, "QRText") == 0) return QRText;
+    return HomeAssistant;
+}
+
+const char *activityToString(Activity a)
+{
+    switch (a) {
+        case HomeAssistant: return "HomeAssistant";
+        case Trmnl: return "Trmnl";
+        case GuestWifi: return "GuestWifi";
+        case Info: return "Info";
+        case Message: return "Message";
+        case IMG: return "IMG";
+        case QRText: return "QRText";
+        case NONE: return "NONE";
+        default: return "HomeAssistant";
+    }
+}
+
+// Helper functions for thread-safe resetActivity access
+static void setResetActivity(bool value) {
+    if (xSemaphoreTake(resetActivityMutex, 100 / portTICK_PERIOD_MS) == pdTRUE) {
+        resetActivity = value;
+        xSemaphoreGive(resetActivityMutex);
+    }
+}
+
+static bool getResetActivity() {
+    bool value = false;
+    if (xSemaphoreTake(resetActivityMutex, 10 / portTICK_PERIOD_MS) == pdTRUE) {
+        value = resetActivity;
+        xSemaphoreGive(resetActivityMutex);
+    }
+    return value;
+}
 
 void startActivity(Activity activity)
 {
-    static SemaphoreHandle_t mutex = xSemaphoreCreateMutex();
-    if (xSemaphoreTake(mutex, (SECOND) / portTICK_PERIOD_MS) == pdTRUE)
+    Activity defaultAct = activityFromString(plateCfg.defaultActivityStr);
+    if (xSemaphoreTake(startActivityMutex, (SECOND) / portTICK_PERIOD_MS) == pdTRUE)
     {
-        // dont re-queue HomeAssistant Activity is run within 60 sec and already running
-        if (activity == HomeAssistant && activityCurrent == HomeAssistant && ((millis() - lastActivityTime) / SECOND < 60))
+        // dont re-queue main Activity is run within 60 sec and already running
+        if (activity == defaultAct && activityCurrent == defaultAct && ((millis() - lastActivityTime) / SECOND < 60))
         {
-            Serial.printf("[ACTIVITY] startActivity(%d) HomeAssistant already running within time limit, skipping\n", activity);
-            xSemaphoreGive(mutex);
+            Serial.printf("[ACTIVITY] startActivity(%d) main activity already running within time limit, skipping\n", activity);
+            xSemaphoreGive(startActivityMutex);
             return;
         }
+        // Bump sleepTime before enqueueing so the sleep task's deadline
+        // wait holds until the activity task wakes, dequeues, and acquires
+        // its own WakeLock — closes the producer/consumer race where the
+        // sleep task could pass the wake-lock gate in the gap between
+        // enqueue and the consumer constructing its lock. NONE is skipped
+        // since it has no case body / no WakeLock to hand off to, and is
+        // itself enqueued by the sleep task on its way down.
+        if (activity != NONE)
+            delaySleep(3);
+
         // insert into queue
         Serial.printf("[ACTIVITY] startActivity(%d) put into queue\n", activity);
-        resetActivity = true;
+        setResetActivity(true);
         xQueueOverwrite(activityQueue, &activity);
-        xSemaphoreGive(mutex);
+        xSemaphoreGive(startActivityMutex);
     }
     else
     {
@@ -38,12 +105,12 @@ void startActivity(Activity activity)
 // returns true if there was an event that should cause the curent activity to stop/break early to start something new
 bool stopActivity()
 {
-    return resetActivity;
+    return getResetActivity();
 }
 
 void waitForWiFiOrActivityChange()
 {
-    while (!WiFi.isConnected() && !resetActivity)
+    while (!WiFi.isConnected() && !getResetActivity())
     {
         vTaskDelay(250 / portTICK_PERIOD_MS);
     }
@@ -51,6 +118,16 @@ void waitForWiFiOrActivityChange()
 
 void runActivities(void *params)
 {
+    uint32_t sleepSec = plateCfg.sleepMinutes * 60;
+    uint32_t quickSleepSec = plateCfg.quickSleepSec;
+    // On the first dequeue after boot (fresh power-on or sleep-wake), hold
+    // briefly so MQTT has time to deliver a retained /action/.../set queued
+    // by HA. 250ms is shorter than the typical retained-delivery window
+    // (~500ms in practice), so the default may still get a head start; the
+    // stopActivity() checks in the activity bodies catch up if a retained
+    // action arrives mid-flight. Subsequent activity transitions skip this.
+    bool firstActivity = true;
+
     while (true)
     {
         printDebug("[ACTIVITY] loop...");
@@ -59,15 +136,28 @@ void runActivities(void *params)
         if (xQueueReceive(activityQueue, &activityNext, portMAX_DELAY) != pdTRUE)
         {
             Serial.printf("[ACTIVITY][ERROR] runActivities() unable to read from activityQueue\n");
-            vTaskDelay(500 / portTICK_PERIOD_MS); // wait just to be safe
+            vTaskDelay(500 / portTICK_PERIOD_MS);
             continue;
         }
         waitForOTA();
-        resetActivity = false;
-        printDebug("[ACTIVITY] runActivities ready...");
+        setResetActivity(false);
 
-        if (activityNext != NONE)
-            delaySleep(10); // bump the sleep timer a little for any ongoing activity
+        if (firstActivity && strlen(plateCfg.mqttHost) > 0)
+        {
+            firstActivity = false;
+            Serial.println("[ACTIVITY] post-boot: holding 250ms for possible MQTT action override");
+            vTaskDelay(250 / portTICK_PERIOD_MS);
+
+            Activity newer;
+            if (xQueueReceive(activityQueue, &newer, 0) == pdTRUE)
+            {
+                Serial.printf("[ACTIVITY] post-boot: MQTT overrode default %d -> %d\n",
+                              activityNext, newer);
+                activityNext = newer;
+                setResetActivity(false);
+            }
+        }
+        printDebug("[ACTIVITY] runActivities ready...");
 
         // activity debounce
         if ((activityNext == activityCurrent) && ((millis() - lastActivityTime) / SECOND < MIN_ACTIVITY_RESTART_SECS))
@@ -80,71 +170,127 @@ void runActivities(void *params)
         activityCount++;
 
         Serial.printf("[ACTIVITY] starting activity: %d\n", activityNext);
+        bool doQuickSleep = activityNext == GuestWifi || activityNext == Info;
+#ifdef CONFIG_CPP
+        TimeInfo time = {
+            .dow = getDayOfWeek(true),
+            .hour = getHour(),
+            .minute = getMinute(),
+        };
+        SleepDefaults defaults = {
+            .normalSleep = sleepSec,
+            .quickSleep = quickSleepSec,
+        };
+        timeToSleep = getSleepDuration(sleepSchedule, sleepScheduleSize, time, defaults, doQuickSleep);
+#else
+        timeToSleep = doQuickSleep ? quickSleepSec : sleepSec;
+#endif
+
         switch (activityNext)
         {
         case NONE:
             break;
         case HomeAssistant:
-            delaySleep(15);
-            setSleepDuration(TIME_TO_SLEEP_SEC);
-            // wait for wifi or reset activity
+        {
+            if (strlen(plateCfg.imageUrl) == 0)
+            {
+                Serial.println("[ACTIVITY] HomeAssistant: no IMAGE_URL configured");
+                break;
+            }
+            WakeLock lock("activity-ha", 90);
+            setSleepDuration(timeToSleep);
             waitForWiFiOrActivityChange();
-            if (resetActivity)
+            if (getResetActivity())
             {
                 Serial.printf("[ACTIVITY][ERROR] HomeAssistant Activity reset while waiting, aborting...\n");
                 continue;
             }
-            // get & render hass image
-            delaySleep(20);
-            remotePNG(IMAGE_URL);
-            // delaySleep(10);
+            drawImageFromURL(plateCfg.imageUrl);
             break;
+        }
+        case Trmnl:
+        {
+            if (strlen(plateCfg.trmnlId) == 0)
+            {
+                Serial.println("[ACTIVITY] Trmnl: no TRMNL_ID configured");
+                break;
+            }
+            WakeLock lock("activity-trmnl", 90);
+            setSleepDuration(timeToSleep);
+            waitForWiFiOrActivityChange();
+            if (getResetActivity())
+            {
+                Serial.printf("[ACTIVITY][ERROR] Trmnl Activity reset while waiting, aborting...\n");
+                continue;
+            }
+            trmnlDisplay(plateCfg.trmnlUrl);
+            break;
+        }
         case GuestWifi:
-            setSleepDuration(TIME_TO_QUICK_SLEEP_SEC);
+        {
+            WakeLock lock("activity-guestwifi", 15);
+            setSleepDuration(timeToSleep);
             displayWiFiQR();
             break;
+        }
         case Info:
-            setSleepDuration(TIME_TO_QUICK_SLEEP_SEC);
+        {
+            WakeLock lock("activity-info", 15);
+            setSleepDuration(timeToSleep);
             displayInfoScreen();
             break;
+        }
         case Message:
-            setSleepDuration(TIME_TO_SLEEP_SEC);
+        {
+            WakeLock lock("activity-message", 15);
+            setSleepDuration(timeToSleep);
             displayMessage();
             break;
+        }
         case IMG:
-            setSleepDuration(TIME_TO_SLEEP_SEC);
+        {
+            WakeLock lock("activity-img", 90);
+            setSleepDuration(timeToSleep);
             waitForWiFiOrActivityChange();
-            if (resetActivity)
+            if (getResetActivity())
             {
-                Serial.printf("[ACTIVITY][ERROR] HomeAssistant Activity reset while waiting, aborting...\n");
+                Serial.printf("[ACTIVITY][ERROR] IMG Activity reset while waiting, aborting...\n");
                 continue;
             }
-            // get & render image
-            delaySleep(20);
-            remotePNG(getMessage());
+            drawImageFromURL(getMessage());
             break;
+        }
+        case QRText:
+        {
+            WakeLock lock("activity-qrtext", 15);
+            setSleepDuration(timeToSleep);
+            displayTextQR(getMessage());
+            break;
+        }
         default:
             Serial.printf("[ACTIVITY][ERROR] runActivities() unhandled Activity: %d\n", activityNext);
         }
-        // check and display a low battery warning if needed
+        // Remember whatever just painted (excluding the sleep-prep NONE),
+        // so Trmnl can decide whether its filename-match dedupe is still
+        // meaningful on the next run.
+        if (activityNext != NONE) {
+            lastDisplayedActivity = activityNext;
+        }
         displayBatteryWarning();
-
-        // send new MQTT status
         sendMQTTStatus();
     }
 }
 
 void startActivitiesTask()
 {
-    // start the main loop stuff
     startMQTTStatusTask();
 
     xTaskCreate(
         runActivities,
-        "ACTIVITY_TASK",        // Task name
-        8192,                   // Stack size
-        NULL,                   // Parameter
-        ACTIVITY_TASK_PRIORITY, // Task priority
-        NULL                    // Task handle
+        "ACTIVITY_TASK",
+        8192,
+        NULL,
+        ACTIVITY_TASK_PRIORITY,
+        NULL
     );
 }

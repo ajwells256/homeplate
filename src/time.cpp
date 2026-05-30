@@ -1,21 +1,23 @@
 #include <NTPClient.h>
-#include <Timezone.h>
 #include <ESP32Time.h>
 
 #include "homeplate.h"
-#include "timezone_config.h"
 #define NTP_TASK_PRIORITY 3
 
 #define JAN_1_2000 946684800
 
 bool ntpSynced = false;
+bool rtcSet = false;
 
 ESP32Time rtc;
 
 long tzOffset(time_t epoch) {
-    TimeChangeRule *tcr; // pointer to the time change rule, use to get TZ abbrev
-    time_t local = tz.toLocal(epoch, &tcr);
-    return local - epoch;
+    struct tm utc;
+    gmtime_r(&epoch, &utc);
+    utc.tm_isdst = -1; // let mktime auto-detect DST from the active TZ rule
+    // mktime interprets its argument as local time, so the difference
+    // between epoch (UTC) and mktime(utc_components) gives the TZ offset
+    return (long)difftime(epoch, mktime(&utc));
 }
 
 bool getNTPSynced()
@@ -25,17 +27,32 @@ bool getNTPSynced()
 
 void ntpSync(void *parameter)
 {
+    if (strlen(plateCfg.ntpServer) == 0)
+    {
+        Serial.println("[TIME] NTP server not configured, skipping sync");
+        vTaskDelete(NULL);
+        return;
+    }
+
     WiFiUDP ntpUDP;
-    NTPClient timeClient(ntpUDP, NTP_SERVER);
-    while (true)
+    NTPClient timeClient(ntpUDP, plateCfg.ntpServer);
+    const int MAX_NTP_RETRIES = 5;
+    int retryCount = 0;
+    while (retryCount < MAX_NTP_RETRIES)
     {
         printDebug("[TIME] loop...");
         waitForWiFi();
-        Serial.println("[TIME] Syncing RTC to NTP");
+        Serial.printf("[TIME] Syncing RTC to NTP (attempt %d/%d)\n", retryCount + 1, MAX_NTP_RETRIES);
         timeClient.begin();
         if (!timeClient.forceUpdate())
         {
+            retryCount++;
             Serial.printf("[TIME] NTP Sync failed\n");
+            if (retryCount >= MAX_NTP_RETRIES)
+            {
+                Serial.printf("[TIME] NTP Sync failed after %d attempts, giving up\n", MAX_NTP_RETRIES);
+                break;
+            }
             vTaskDelay((30 * SECOND) / portTICK_PERIOD_MS);
             continue;
         }
@@ -46,28 +63,30 @@ void ntpSync(void *parameter)
 
         /* RTC */
         i2cStart();
-        uint32_t rtcEpoch = display.rtcGetEpoch();
+        uint32_t rtcEpoch = display.rtc.getEpoch();
         time_t ntp_et = timeClient.getEpochTime();
-        display.rtcSetEpoch(ntp_et);
+        display.rtc.setEpoch(ntp_et);
         rtc.setTime(ntp_et);
         i2cEnd();
 
         // print how far the clocks are off
         long delta_s = (ntp_et - localTime);
         Serial.printf("[TIME] Internal clock was adjusted by %ld seconds\n", delta_s);
-        Serial.printf("[TIME] Internal RTC was adjusted by %ld seconds\n", (ntp_et - rtcEpoch));
+        Serial.printf("[TIME] Internal RTC was adjusted by %lld seconds\n", (long long)(ntp_et - rtcEpoch));
 
         ntpSynced = true;
-        // rtc.offset is unsigned, but it is used as a signed long for negative offsets
+        // TZ env (set in config_manager via setenv/tzset) drives localtime
+        // conversion inside ESP32Time; rtc.offset must stay 0 to avoid
+        // double-applying the offset. tzOffset() is computed only for the
+        // informational log line below.
         long offset = tzOffset(ntp_et);
-        rtc.offset = offset;
         localTime = rtc.getLocalEpoch();
-        Serial.printf("[TIME] NTP UNIX time Epoch(%ld)\n", ntp_et);
+        Serial.printf("[TIME] NTP UNIX time Epoch(%lld)\n", (long long)ntp_et);
         Serial.printf("[TIME] Timezone offset: (%ld) %ld hours\n", offset, (offset/60/60));
         Serial.printf("[TIME] synced local UNIX time Epoch(%ld) %s \n", localTime, fullDateString().c_str());
 
         i2cStart();
-        bool rtcSet = display.rtcIsSet();
+        rtcSet = display.rtc.isSet();
         i2cEnd();
         if (!rtcSet) {
             Serial.printf("[TIME] ERROR: Failed to set RTC!\n");
@@ -82,42 +101,88 @@ void ntpSync(void *parameter)
 void setupTimeAndSyncTask()
 {
     unsigned long localTime = rtc.getLocalEpoch();
+    uint32_t rtcEpoch = 0;
     i2cStart();
-    bool rtcSet = display.rtcIsSet();
+    rtcSet = display.rtc.isSet();
     if (rtcSet) {
-        uint32_t rtcEpoch = display.rtcGetEpoch();
-        rtc.offset = tzOffset(rtcEpoch);
+        rtcEpoch = display.rtc.getEpoch();
         Serial.printf("[TIME] Internal Clock and RTC differ by %ld seconds. local(%ld) RTC(%ld)\n", (localTime - rtcEpoch), localTime, rtcEpoch);
     }
     i2cEnd();
+
+    // On cold boot the ESP32 system clock starts at 0; ESP-IDF preserves it
+    // across deep sleep but not across power-on. If the hardware RTC has a
+    // sane value, seed the system clock from it so user-facing time is right
+    // before NTP sync completes.
+    if (rtcSet && rtcEpoch >= JAN_1_2000 && localTime < JAN_1_2000) {
+        rtc.setTime(rtcEpoch);
+        localTime = rtc.getLocalEpoch();
+        Serial.printf("[TIME] Seeded system clock from hardware RTC: %lu\n", localTime);
+    }
+
     Serial.printf("[TIME] local time (%lu) %s\n", localTime, fullDateString().c_str());
 
-    if (rtcSet && localTime < JAN_1_2000) {
+    if (rtcSet && rtcEpoch < JAN_1_2000) {
         Serial.printf("[TIME] ERROR: RTC time is too far in past. RTC likely has wrong value!\n");
         rtcSet = false;
     }
 
-    #ifdef NTP_SERVER
+    if (strlen(plateCfg.ntpServer) > 0)
+    {
+        uint16_t syncInterval = getNtpSyncInterval();
         // Sync RTC if unset or fresh boot
-        bool resync = ((bootCount % (NTP_SYNC_INTERVAL)) == 0);
-        if (resync) Serial.printf("[TIME] re-syncing NTP: on boot %d, ever %d\n", bootCount, NTP_SYNC_INTERVAL);
+        bool resync = ((bootCount % syncInterval) == 0);
+        if (resync) Serial.printf("[TIME] re-syncing NTP: on boot %d, every %d\n", bootCount, syncInterval);
         if (!rtcSet || !sleepBoot || resync)
         {
             xTaskCreate(
                 ntpSync,           /* Task function. */
                 "NTP_TASK",        /* String with name of task. */
-                2048,              /* Stack size */
+                // 8192 under arduino-esp32 v3 — UDP/WiFi/lwIP call chains
+                // overflow at 2048 (which worked under v2.0.17).
+                8192,              /* Stack size */
                 NULL,              /* Parameter passed as input of the task */
                 NTP_TASK_PRIORITY, /* Priority of the task. */
                 NULL);             /* Task handle. */
         }
-    #endif
+    }
 }
 
 String fullDateString() {
     return rtc.getTimeDate(true);
 }
 
+String shortDateTimeString() {
+    return rtc.getTime("%Y-%m-%d %H:%M");
+}
+
 String timeString() {
     return rtc.getTime("%H:%M");
+}
+
+int getDayOfWeek(bool weekStartsOnMonday) {
+    if (!rtcSet) {
+        return -1;
+    }
+
+    int dow = rtc.getDayofWeek();
+    if (weekStartsOnMonday) {
+        return (dow == 0) ? 7 : dow;
+    } else {
+        return dow + 1;
+    }
+}
+
+int getHour() {
+    if (!rtcSet) {
+        return -1;
+    }
+    return rtc.getHour(true);
+}
+
+int getMinute() {
+    if (!rtcSet) {
+        return -1;
+    }
+    return rtc.getMinute();
 }

@@ -3,39 +3,99 @@ name: PlatformIO CI
 on:
   push:
     branches: [ "main" ]
+    paths: [ "src/**", "test/**", "platformio.ini", ".github/workflows/build.yml", ".github/actions/setup-platformio/**" ]
   pull_request:
     branches: [ "main" ]
+    paths: [ "src/**", "test/**", "platformio.ini", ".github/workflows/build.yml", ".github/actions/setup-platformio/**" ]
+  workflow_call: # allow calling from other workflows
   workflow_dispatch: # allow manually calling the action
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  build:
+  test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
-      - name: Cache pip
-        uses: actions/cache@v3
+      - uses: actions/checkout@v6
         with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-      - name: Cache PlatformIO
-        uses: actions/cache@v3
-        with:
-          path: ~/.platformio
-          key: ${{ runner.os }}-${{ hashFiles('**/lockfiles') }}
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.10'
-      - name: Install PlatformIO
+          fetch-depth: 0
+      - name: Set up PlatformIO
+        uses: ./.github/actions/setup-platformio
+      - name: Run PlatformIO Tests
+        run: pio test -e native
+
+  discover-envs:
+    runs-on: ubuntu-latest
+    outputs:
+      envs: ${{ steps.parse.outputs.envs }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Parse default_envs from platformio.ini
+        id: parse
         run: |
-          python -m pip install --upgrade pip
-          pip install --upgrade platformio
-      - name: Install PlatformIO Libs
-        run: pio pkg install
-      - name: Use example config
-        run: cp src/config_example.h src/config.h
-      - name: Run PlatformIO
-        # empty target to prevent upload
-        run: pio run -t ''
+          python3 - <<'EOF' >> "$GITHUB_OUTPUT"
+          import configparser, json
+          c = configparser.ConfigParser()
+          c.read('platformio.ini')
+          envs = c['platformio']['default_envs'].split()
+          print('envs=' + json.dumps(envs))
+          EOF
+
+  build:
+    needs: discover-envs
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        environment: ${{ fromJSON(needs.discover-envs.outputs.envs) }}
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Set up PlatformIO
+        uses: ./.github/actions/setup-platformio
+      - name: Build ${{ matrix.environment }}
+        run: pio run -e ${{ matrix.environment }}
+      - name: Generate idedata
+        run: pio run -e ${{ matrix.environment }} -t idedata
+      - name: Collect flash binaries
+        run: |
+          mkdir -p flash-package
+          IDEDATA=".pio/build/${{ matrix.environment }}/idedata.json"
+
+          # Copy firmware
+          cp .pio/build/${{ matrix.environment }}/firmware.bin flash-package/firmware.bin
+          cp .pio/build/${{ matrix.environment }}/firmware.bin flash-package/homeplate-${{ matrix.environment }}.bin
+
+          # Copy extra flash images (bootloader, partitions, boot_app0) from idedata
+          for row in $(python3 -c "import json; d=json.load(open('$IDEDATA')); [print(r['path']) for r in d['extra']['flash_images']]"); do
+            cp "$row" flash-package/
+          done
+
+          # Generate ESP Web Tools manifest from idedata
+          python3 -c "
+          import json
+          d = json.load(open('$IDEDATA'))
+          parts = [{'path': '${{ matrix.environment }}/' + p['path'].rsplit('/',1)[1], 'offset': int(p['offset'],16)} for p in d['extra']['flash_images']]
+          # Application offset: idedata.json under pioarduino / arduino-esp32 v3
+          # no longer includes 'application_offset' under 'extra'. Fall back to
+          # 0x10000 which is the standard offset across all default arduino-esp32
+          # partition layouts (min_spiffs.csv, default.csv, huge_app.csv, etc.)
+          # and matches our pinned 'board_build.partitions = min_spiffs.csv'.
+          app_offset = int(d['extra'].get('application_offset', '0x10000'), 16)
+          parts.append({'path': '${{ matrix.environment }}/firmware.bin', 'offset': app_offset})
+          manifest = {
+            'name': 'HomePlate (${{ matrix.environment }})',
+            'version': 'VERSION_PLACEHOLDER',
+            'new_install_prompt_erase': True,
+            'builds': [{'chipFamily': 'ESP32', 'parts': parts}]
+          }
+          json.dump(manifest, open('flash-package/manifest.json','w'), indent=2)
+          "
+      - name: Upload firmware
+        uses: actions/upload-artifact@v7
+        with:
+          name: homeplate-${{ matrix.environment }}
+          path: flash-package/

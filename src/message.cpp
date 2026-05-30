@@ -13,25 +13,14 @@ const char* getMessage()
     return message;
 }
 
-static const GFXfont *fonts[] = {&Roboto_128, &Roboto_64, &Roboto_32, &Roboto_16, &Roboto_12};
-
-struct FontSizing
-{
-    const GFXfont *font;
-    uint16_t height;
-    uint16_t width;
-    uint8_t lineHeight;
-    uint8_t yAdvance;
-};
-
-FontSizing findFontSizeFit(char *m)
+FontSizing findFontSizeFit(const char *m, uint16_t max_width, uint16_t max_height)
 {
     int16_t x1, y1;
     FontSizing font;
 
     // display.setTextWrap(false);
 
-    for (size_t i = 0; i < sizeof(fonts) / sizeof(fonts[0]); i++)
+    for (size_t i = 0; i < fontsCount; i++)
     {
         font.font = fonts[i];
         display.setFont(font.font);
@@ -40,7 +29,7 @@ FontSizing findFontSizeFit(char *m)
         font.yAdvance = (uint8_t)font.font->yAdvance;
         font.lineHeight = font.height % font.yAdvance;
         // Serial.printf("[MESSAGE][DEBUG] Testing font # %u with height = %u and width = %u  bounds = (%d, %d) lineHeight = %d\n", i, font.height, font.width, x1, y1, font.lineHeight);
-        if (font.width <= E_INK_WIDTH && font.height <= E_INK_HEIGHT)
+        if (font.width <= max_width && font.height <= max_height)
         {
             // Serial.printf("[MESSAGE] Using font %u with height = %u and width = %u  bounds = (%d, %d) screen(%d, %d) lineHeight = %d\n", i, font.height, font.width, x1, y1, E_INK_WIDTH, E_INK_HEIGHT, font.lineHeight);
             return font;
@@ -48,6 +37,24 @@ FontSizing findFontSizeFit(char *m)
     }
     Serial.printf("[MESSAGE][ERROR] Unable to find good font size for %s\n", m);
     return font;
+}
+
+// displayCriticalMessage: like displayStatusMessage, but falls back to a
+// full-screen displayMessage() on boards without partial update (where
+// displayStatusMessage is a no-op). Use for error/state messages that must
+// be visible; use displayStatusMessage for progress that's OK to drop.
+void displayCriticalMessage(const char *format, ...)
+{
+    char buf[256];
+    va_list argptr;
+    va_start(argptr, format);
+    vsnprintf(buf, sizeof(buf), format, argptr);
+    va_end(argptr);
+#ifdef INKPLATE_HAS_PARTIAL_UPDATE
+    displayStatusMessage("%s", buf);
+#else
+    displayMessage(buf);
+#endif
 }
 
 void displayMessage(const char *m)
@@ -60,12 +67,14 @@ void displayMessage(const char *m)
     Serial.printf("[MESSAGE] rendering message: %s\n", message);
 
     displayStart();
+#ifdef INKPLATE_HAS_DISPLAY_MODES
     display.selectDisplayMode(INKPLATE_1BIT);
-    display.setTextColor(BLACK, WHITE);
+#endif
+    display.setTextColor(HP_FG, HP_BG);
     display.setTextSize(1);
     display.clearDisplay();
 
-    FontSizing font = findFontSizeFit(message);
+    FontSizing font = findFontSizeFit(message, E_INK_WIDTH, E_INK_HEIGHT);
     display.setFont(font.font);
 
     char *savePtr;
@@ -101,7 +110,7 @@ void displayMessage(const char *m)
 
     i2cStart();
     displayStart();
-    display.display();
+    displayRefresh();
     displayEnd();
     i2cEnd();
 }

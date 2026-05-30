@@ -1,13 +1,13 @@
 #include "homeplate.h"
 
-#if defined(ARDUINO_INKPLATE10V2) && TOUCHPAD_ENABLE
-#error "TOUCHPAD_ENABLE is not supported with ARDUINO_INKPLATE10V2"
+#if (defined(ARDUINO_INKPLATE10V2) || defined(ARDUINO_INKPLATE6V2) || defined(ARDUINO_INKPLATE6PLUS) || defined(ARDUINO_INKPLATE6PLUSV2) || defined(ARDUINO_INKPLATE6FLICK)) && TOUCHPAD_ENABLE
+#error "TOUCHPAD_ENABLE is not supported on this board"
 #endif
 
 #define INPUT_TASK_PRIORITY 10
 
-// only supported on the Inkplate10 (not v2)
-#if defined(ARDUINO_INKPLATE10)
+// only supported on boards with touchpads (Inkplate 10 v1, Inkplate 6 v1)
+#ifdef HAS_TOUCHPADS
 
 #define INT_PAD1 (1 << (PAD1 - 8)) // 0x04
 #define INT_PAD2 (1 << (PAD2 - 8)) // 0x08
@@ -25,12 +25,13 @@ unsigned int readMCPRegister(const byte reg)
 
 // assume i2clock is already taken
 // debounce touches that are too quick
+// pad is the touchpad index 1, 2 or 3
 bool checkPad(uint8_t pad)
 {
-    if (display.readTouchpad(pad))
+    if (display.touchpad.read(pad))
     {
         vTaskDelay(250 / portTICK_PERIOD_MS);
-        return display.readTouchpad(pad);
+        return display.touchpad.read(pad);
     }
     return false;
 }
@@ -56,30 +57,32 @@ void checkButtons(void *params)
         // check buttons
         if (TOUCHPAD_ENABLE)
         {
-            if (checkPad(PAD1))
+            if (checkPad(1))
             {
                 Serial.printf("[INPUT] touchpad 1\n");
-                startActivity(HomeAssistant);
+                startActivity(activityFromString(plateCfg.defaultActivityStr));
                 button = true;
             }
-            else if (checkPad(PAD2))
+            else if (checkPad(2))
             {
                 Serial.printf("[INPUT] touchpad 2\n");
                 startActivity(GuestWifi);
                 button = true;
             }
-            else if (checkPad(PAD3))
+            else if (checkPad(3))
             {
                 Serial.printf("[INPUT] touchpad 3\n");
                 startActivity(Info);
                 button = true;
             }
+            #ifdef WAKE_BUTTON
             else if (!digitalRead(WAKE_BUTTON))
             {
                 Serial.printf("[INPUT] wake button\n");
-                startActivity(HomeAssistant);
+                startActivity(activityFromString(plateCfg.defaultActivityStr));
                 button = true;
             }
+            #endif
         }
 
         if (button)
@@ -96,11 +99,11 @@ void checkButtons(void *params)
     }
 }
 
-#endif // defined(ARDUINO_INKPLATE10)
+#endif // HAS_TOUCHPADS
 
 void startMonitoringButtonsTask()
 {
-    #if defined(ARDUINO_INKPLATE10)
+    #ifdef HAS_TOUCHPADS
         // inkplate code needs to be on arduino core or may get i2c errors
         // use mutex for all inkplate code
         xTaskCreatePinnedToCore(
@@ -118,61 +121,54 @@ void startMonitoringButtonsTask()
 
 void checkBootPads()
 {
-    #if defined(ARDUINO_INKPLATE10)
-        unsigned int key = 0;
-        i2cStart();
-        key = readMCPRegister(MCP23017_INTFB);
-        i2cEnd();
-        if (key) // which pin caused interrupt
-        {
-            // Serial.printf("INTFB: %#x\n", keyInt);
-            //  value of pin at time of interrupt
-            if (key & INT_PAD1)
-            {
-                Serial.println("[INPUT] boot: PAD1");
-                startActivity(HomeAssistant);
-            }
-            else if (key & INT_PAD2)
-            {
-                Serial.println("[INPUT] boot: PAD2");
-                startActivity(GuestWifi);
-            }
-            else if (key & INT_PAD3)
-            {
-                Serial.println("[INPUT] boot: PAD3");
-                startActivity(Info);
-            }
-            Serial.println();
+    #ifdef HAS_TOUCHPADS
+        // Read the INTF and INTCAP values that the MCP latched at the moment
+        // of the wake-triggering interrupt.
+        uint16_t intf   = display.expander1.getInterruptFlagsAtBegin();
+        uint16_t intcap = display.expander1.getInterruptCaptureAtBegin();
+        // Port B is in the high byte; the touchpad pins (10/11/12) live there.
+        uint8_t  intfB   = (intf >> 8) & 0xFF;
+        uint8_t  intcapB = (intcap >> 8) & 0xFF;
+        // Rising-edge filter: only treat a pad as "pressed" if it was HIGH at
+        // the instant of the interrupt. This rejects falling edges (release)
+        // and noise that already returned to LOW.
+        uint8_t rising = intfB & intcapB;
 
-            i2cStart();
-            key = readMCPRegister(MCP23017_INTCAPB); // this clears the interrupt
-            i2cEnd();
-            // Serial.printf("INTCAP: %#x\n", keyValue);
-            //  if (keyValue & INT_PAD1)
-            //  {
-            //      Serial.print("PAD1 ");
-            //  }
-            //  if (keyValue & INT_PAD2)
-            //  {
-            //      Serial.print("PAD2 ");
-            //  }
-            //  if (keyValue & INT_PAD3)
-            //  {
-            //      Serial.print("PAD3 ");
-            //  }
-            //  Serial.println();
+        Serial.printf("[INPUT] boot wake: INTFB=%#x INTCAPB=%#x rising=%#x\n",
+                      intfB, intcapB, rising);
+
+        if (rising & INT_PAD1)
+        {
+            Serial.println("[INPUT] boot: PAD1");
+            startActivity(activityFromString(plateCfg.defaultActivityStr));
+        }
+        else if (rising & INT_PAD2)
+        {
+            Serial.println("[INPUT] boot: PAD2");
+            startActivity(GuestWifi);
+        }
+        else if (rising & INT_PAD3)
+        {
+            Serial.println("[INPUT] boot: PAD3");
+            startActivity(Info);
+        }
+        else if (intfB)
+        {
+            Serial.println("[INPUT] boot: spurious wake (release / noise), ignoring");
         }
     #endif
 }
 
 void setupWakePins()
 {
-    #if defined(ARDUINO_INKPLATE10)
-        // set which pads can allow wakeup
-        display.setIntPin(PAD1, RISING, IO_INT_ADDR);
-        display.setIntPin(PAD2, RISING, IO_INT_ADDR);
-        display.setIntPin(PAD3, RISING, IO_INT_ADDR);
+    #if TOUCHPAD_ENABLE && defined(HAS_TOUCHPADS)
+        // Configure each touchpad pin to wake on rising edge only (press,
+        // not release / capacitive noise).
+        display.expander1.setIntPin(PAD1, RISING);
+        display.expander1.setIntPin(PAD2, RISING);
+        display.expander1.setIntPin(PAD3, RISING);
     #endif
-    pinMode(WAKE_BUTTON, INPUT_PULLUP);
-
+    #ifdef WAKE_BUTTON
+        pinMode(WAKE_BUTTON, WAKE_BUTTON_MODE);
+    #endif
 }

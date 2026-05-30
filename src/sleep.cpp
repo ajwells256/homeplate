@@ -1,21 +1,28 @@
 #include "homeplate.h"
 
-#define uS_TO_S_FACTOR 1000000 // Conversion factor for micro seconds to seconds
+#define uS_TO_S_FACTOR 1000000ULL // Conversion factor for micro seconds to seconds
 #define SLEEP_TASK_PRIORITY 1
 #define TOUCHPAD_WAKE_MASK (int64_t(1) << GPIO_NUM_34)
 
 static unsigned long sleepTime;
-uint32_t sleepDuration = TIME_TO_SLEEP_SEC;
+uint32_t sleepDuration = 0; // set from plateCfg at boot
 uint32_t sleepRefresh = 0;
-
-void setSleepRefresh(uint32_t sec)
-{
-    sleepRefresh = sec;
-}
 
 void setSleepDuration(uint32_t sec)
 {
-    sleepDuration = sec;
+    if (sec > 0 && sec < MAX_REFRESH_SEC)
+      {
+        sleepDuration = sec;
+      }
+      else
+      {
+        Serial.printf("[SLEEP][ERROR] refresh value is out of range: %d\n", sec);
+      }
+}
+
+uint32_t getSleepDuration()
+{
+    return sleepDuration;
 }
 
 void gotoSleepNow()
@@ -32,28 +39,45 @@ void gotoSleepNow()
     // disconnect WiFi as it's no longer needed
     mqttStopTask(); // prevent i2c lock in main thread
     wifiStopTask(); // prevent i2c lock in main thread
-
-    #if defined(ARDUINO_INKPLATE10)
-        // set MCP interrupts
-        if (TOUCHPAD_ENABLE)
-            display.setIntOutput(1, false, false, HIGH, IO_INT_ADDR);
-        #endif
     i2cEnd();
 
-
-    // Go to sleep for TIME_TO_SLEEP seconds
-    if (esp_sleep_enable_timer_wakeup(sleepDuration * uS_TO_S_FACTOR) != ESP_OK) {
-        Serial.printf("[SLEEP] ERROR esp_sleep_enable_timer_wakeup(%u) invalid value", sleepDuration * uS_TO_S_FACTOR);
+    // Prevent integer overflow by checking max sleep duration (ESP32 limit is ~71 minutes)
+    const uint32_t MAX_SLEEP_SECONDS = 4200; // ~70 minutes to stay well under ESP32 limit
+    uint32_t safeSleepDuration = (sleepDuration > MAX_SLEEP_SECONDS) ? MAX_SLEEP_SECONDS : sleepDuration;
+    
+    uint64_t sleepMicroseconds = (uint64_t)safeSleepDuration * uS_TO_S_FACTOR;
+    if (esp_sleep_enable_timer_wakeup(sleepMicroseconds) != ESP_OK) {
+        Serial.printf("[SLEEP] ERROR esp_sleep_enable_timer_wakeup(%llu) invalid value\n", sleepMicroseconds);
     }
 
-    // Enable wakeup from deep sleep on gpio 36 (WAKE BUTTON)
-    esp_sleep_enable_ext0_wakeup(WAKE_BUTTON, LOW);
-    #if defined(ARDUINO_INKPLATE10)
+    #ifdef WAKE_BUTTON
+        // Enable wakeup from deep sleep on WAKE BUTTON
+        esp_sleep_enable_ext0_wakeup(WAKE_BUTTON, LOW);
+    #endif
+
+    #if defined(ARDUINO_INKPLATE10) || defined(ARDUINO_INKPLATE10V2) || defined(ARDUINO_INKPLATE6) || defined(ARDUINO_INKPLATE6V2)
         // enable wake from MCP port expander
         if (TOUCHPAD_ENABLE)
             esp_sleep_enable_ext1_wakeup(TOUCHPAD_WAKE_MASK, ESP_EXT1_WAKEUP_ANY_HIGH);
     #endif
-    Serial.printf("[SLEEP] entering sleep for %u seconds (%u min)\n\n\n", sleepDuration, sleepDuration / 60);
+
+    #if TOUCHPAD_ENABLE && defined(HAS_TOUCHPADS)
+        // Clear any latched MCP interrupt before sleeping. INTF can be set
+        // by transient capacitive noise, by the act of enabling GPINTEN
+        // while a pin happens to be HIGH, or by a real touch during sleep
+        // prep. If left latched the MCP's INT line stays asserted, GPIO 34
+        // stays HIGH, and the ESP32's ext1 wakeup fires immediately upon
+        // esp_deep_sleep_start() — manifesting as a spurious "touchpad"
+        // wake with no actual pad pressed. Reading INTCAP releases the
+        // latch and de-asserts INT; a genuine subsequent press will then
+        // properly re-trigger the wake.
+        i2cStart();
+        readMCPRegister(MCP23017_INTCAPA);
+        readMCPRegister(MCP23017_INTCAPB);
+        i2cEnd();
+    #endif
+
+    Serial.printf("[SLEEP] entering sleep for %u seconds (%u min)\n\n\n", safeSleepDuration, safeSleepDuration / 60);
     vTaskDelay(50 / portTICK_PERIOD_MS);
     esp_deep_sleep_start(); // Put ESP32 into deep sleep. Program stops here.
 }
@@ -79,6 +103,13 @@ void checkSleep(void *parameter)
         while (sleepTime > millis())
         {
             vTaskDelay(SECOND / portTICK_PERIOD_MS);
+        }
+
+        // wait for any wake locks to release
+        if (anyWakeLocksHeld())
+        {
+            vTaskDelay(SECOND / portTICK_PERIOD_MS);
+            continue;
         }
 
         // wait for mqtt messages to send
@@ -109,7 +140,9 @@ void sleepTask()
     xTaskCreate(
         checkSleep,
         "SLEEP_TASK",        // Task name
-        2048,                // Stack size
+        // 4096 under arduino-esp32 v3 — eventually calls WiFi.disconnect()
+        // via wifiStopTask() which has fat lwIP/WiFi call chains.
+        4096,                // Stack size
         NULL,                // Parameter
         SLEEP_TASK_PRIORITY, // Task priority
         NULL                 // Task handle

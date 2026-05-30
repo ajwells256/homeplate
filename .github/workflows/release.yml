@@ -1,0 +1,85 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download firmware artifacts
+        uses: actions/download-artifact@v8
+      - name: Create Release
+        uses: softprops/action-gh-release@v3
+        with:
+          generate_release_notes: true
+          append_body: true
+          body: |
+            ## Install
+
+            Flash directly from your browser using the [Web Installer](https://lanrat.github.io/homeplate/).
+          files: |
+            homeplate-*/homeplate-*.bin
+
+  deploy-web-installer:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Download firmware artifacts
+        uses: actions/download-artifact@v8
+      - name: Prepare GitHub Pages site
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+
+          mkdir -p site
+
+          # Copy web installer page
+          cp web-installer/index.html site/
+
+          # Discover and copy all firmware variants dynamically
+          BOARDS="["
+          FIRST=true
+          for dir in homeplate-*/; do
+            env="${dir#homeplate-}"
+            env="${env%/}"
+            mkdir -p "site/${env}"
+            cp "homeplate-${env}/bootloader.bin" "site/${env}/"
+            cp "homeplate-${env}/partitions.bin" "site/${env}/"
+            cp "homeplate-${env}/boot_app0.bin" "site/${env}/"
+            cp "homeplate-${env}/firmware.bin" "site/${env}/"
+            sed "s/VERSION_PLACEHOLDER/$VERSION/" "homeplate-${env}/manifest.json" > "site/manifest-${env}.json"
+            if [ "$FIRST" = true ]; then
+              FIRST=false
+            else
+              BOARDS+=","
+            fi
+            BOARDS+="\"${env}\""
+          done
+          BOARDS+="]"
+          echo "{\"version\":\"${VERSION}\",\"boards\":${BOARDS}}" > site/boards.json
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: site/
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5

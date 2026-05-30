@@ -1,18 +1,16 @@
-// Next 3 lines are a precaution, you can ignore those, and the example would also work without them
-#if !defined(ARDUINO_INKPLATE10) && !defined(ARDUINO_INKPLATE10V2)
-#error "Wrong board selection for this example, please select Inkplate 10 in the boards menu."
-#endif
-
-#if defined(ARDUINO_INKPLATE10) && defined(ARDUINO_INKPLATE10V2)
-#error "You can only define ARDUINO_INKPLATE10 or ARDUINO_INKPLATE10V2, not both"
-#endif
-
 #include <driver/rtc_io.h> //ESP32 library used for deep sleep and RTC wake up pins
 #include <rom/rtc.h>       // Include ESP32 library for RTC (needed for rtc_get_reset_reason() function)
 #include "homeplate.h"
 
+#ifdef INKPLATE_HAS_DISPLAY_MODES
 Inkplate display(INKPLATE_1BIT);
-SemaphoreHandle_t mutexI2C, mutexSPI, mutexDisplay;
+#else
+Inkplate display;
+#endif
+
+// Font array for findFontSizeFit() — largest to smallest
+const GFXfont *fonts[] = {&FONT_SPLASH, &FONT_TITLE, &FONT_HEADING, &FONT_BODY, &FONT_SMALL};
+const size_t fontsCount = sizeof(fonts) / sizeof(fonts[0]);
 
 bool sleepBoot = false;
 
@@ -25,13 +23,14 @@ void setup()
     Serial.printf("\n\n[SETUP] starting, version(%s) boot: %u\n", VERSION, bootCount);
     ++bootCount;
     // reset GPIOs used for wake interrupt
-    rtc_gpio_deinit(GPIO_NUM_34);
-    rtc_gpio_deinit(WAKE_BUTTON);
+    #if defined(ARDUINO_INKPLATE10) || defined(ARDUINO_INKPLATE10V2) || defined(ARDUINO_INKPLATE6) || defined(ARDUINO_INKPLATE6V2)
+        rtc_gpio_deinit(GPIO_NUM_34); // touchpad wake mask pin
+    #endif
+    #ifdef WAKE_BUTTON
+        rtc_gpio_deinit(WAKE_BUTTON);
+    #endif
 
-    // start inkplate display mutexes
-    mutexI2C = xSemaphoreCreateMutex();
-    mutexSPI = xSemaphoreCreateMutex();
-    mutexDisplay = xSemaphoreCreateMutex();
+    inkplateMutexInit();
 
     sleepBoot = (rtc_get_reset_reason(0) == DEEPSLEEP_RESET); // test for deep sleep wake
 
@@ -39,26 +38,53 @@ void setup()
     if (!sleepBoot)
         printChipInfo();
 
-    // must be called before checkPads() so buttons can override pre-boot activity
-    startActivity(DEFAULT_ACTIVITY);
+    // Load configuration from NVS (with compile-time defaults as fallback)
+    loadConfig();
 
-    // check touchpads for wake event, must be done before display.begin()
-    if (sleepBoot && TOUCHPAD_ENABLE)
-    {
-        Wire.begin(); // this is called again in display.begin(), but it does not appear to be an issue...
-        checkBootPads();
-    }
+    // Set sleep duration from config (must happen before any sleep logic)
+    setSleepDuration(plateCfg.sleepMinutes * 60);
+
+    // must be called before checkPads() so buttons can override pre-boot activity
+    startActivity(activityFromString(plateCfg.defaultActivityStr));
 
     // Take the mutex
     displayStart();
     i2cStart();
     display.begin();             // Init Inkplate library (you should call this function ONLY ONCE)
-    display.rtcClearAlarmFlag(); // Clear alarm flag from any previous alarm
+    display.rtc.clearAlarmFlag(); // Clear alarm flag from any previous alarm
+    i2cEnd();
+    displayEnd();
+
+    // Check which touchpad triggered the wake. Reads cached INTF / INTCAP
+    // values that the patched library snapshotted during display.begin()
+    // before clearing the MCP's INTF latch — no I2C performed here, just
+    // member-variable reads. See soldered-inkplate-v11-issue.md Issue 4.
+    if (sleepBoot && TOUCHPAD_ENABLE)
+    {
+        checkBootPads();
+    }
+
+    // ditherKernel: 0 = None, 1-7 = DitherKernel enum shifted by +1
+    if (plateCfg.ditherKernel > 0)
+    {
+        display.image.setDitherKernel(
+            (decltype(display.image)::DitherKernel)(plateCfg.ditherKernel - 1));
+    }
+
+    displayStart();
+    i2cStart();
     setupWakePins();
 
+    // Read wake button state now, before SD card SPI init may reconfigure the pin
+#ifdef WAKE_BUTTON
+    bool wakeButtonHeld = (digitalRead(WAKE_BUTTON) == LOW);
+#endif
+
     // setup display
+#ifdef INKPLATE_HAS_PARTIAL_UPDATE
     if (sleepBoot)
         display.preloadScreen(); // copy saved screen state to buffer
+#endif
     display.clearDisplay();      // Clear frame buffer of display
     i2cEnd();
     displayEnd();
@@ -94,17 +120,70 @@ void setup()
     Serial.println("[SETUP] starting button task");
     startMonitoringButtonsTask();
 
+    // WiFiManager: handles initial WiFi connection and config portal
+    // Force portal if device has never been configured via NVS,
+    // if the selected activity is missing required settings,
+    // or if the wake button is held during boot
+    bool forcePortal = !isConfigured();
+    if (consumeForcePortalFlag())
+    {
+        Serial.println("[SETUP] force_portal flag set via MQTT, forcing config portal");
+        forcePortal = true;
+    }
+#ifdef WAKE_BUTTON
+    // Only honor a held wake button on a fresh boot (power-on / reset).
+    // Skipping this on deep-sleep wake avoids the long-press that woke the
+    // device being misread as "hold to enter setup".
+    if (!forcePortal && wakeButtonHeld && !sleepBoot)
+    {
+        Serial.println("[SETUP] Wake button held at fresh boot, forcing config portal");
+        forcePortal = true;
+    }
+#endif
+    if (!forcePortal)
+    {
+        Activity act = activityFromString(plateCfg.defaultActivityStr);
+        if ((act == HomeAssistant && strlen(plateCfg.imageUrl) == 0) ||
+            (act == Trmnl && strlen(plateCfg.trmnlId) == 0) ||
+            (act == GuestWifi && strlen(plateCfg.qrWifiName) == 0))
+        {
+            Serial.println("[SETUP] Activity missing required settings, forcing config portal");
+            forcePortal = true;
+        }
+    }
+    if (forcePortal)
+        Serial.println("[SETUP] Device not configured, forcing config portal");
+    Serial.println("[SETUP] starting WiFiManager");
+    if (!startWiFiManager(forcePortal))
+    {
+        // WiFiManager timed out - no connection established
+        Serial.println("[SETUP] WiFiManager timeout, going to sleep");
+        displayUnconfiguredScreen();
+        setSleepDuration(plateCfg.sleepMinutes * 60);
+        gotoSleepNow();
+        return; // won't reach here after deep sleep
+    }
+
+    Serial.println("[SETUP] WiFi connected, continuing setup");
+
     Serial.println("[SETUP] starting time task");
     setupTimeAndSyncTask();
 
-    Serial.println("[SETUP] starting WiFi task");
+    // Start WiFi reconnection task for ongoing connectivity
+    Serial.println("[SETUP] starting WiFi reconnect task");
     wifiConnectTask();
 
-    Serial.println("[SETUP] starting OTA task");
-    startOTATask();
+    if (plateCfg.enableOta)
+    {
+        Serial.println("[SETUP] starting OTA task");
+        startOTATask();
+    }
 
-    Serial.println("[SETUP] starting MQTT task");
-    startMQTTTask();
+    if (strlen(plateCfg.mqttHost) > 0)
+    {
+        Serial.println("[SETUP] starting MQTT task");
+        startMQTTTask();
+    }
 
     Serial.println("[SETUP] starting sleep task");
     sleepTask();
